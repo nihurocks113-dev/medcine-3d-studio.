@@ -1,51 +1,155 @@
 
-import streamlit as st
-from pipeline import extract_content, generate_storyboard, render_video
+
 import os
 import tempfile
+from pathlib import Path
 
-st.set_page_config(page_title="MedCine 3D Studio", layout="wide")
-st.title("🧬 MedCine 3D Studio")
-st.write("Turn medical documents into educational videos.")
+import streamlit as st
 
-uploaded = st.file_uploader(
-    "Upload a medical image or document",
-    type=["png", "jpg", "jpeg", "webp", "pdf", "txt", "docx", "pptx"]
+from pipeline import extract_content
+from render_3d import render_lumbar_spine
+
+
+st.set_page_config(
+    page_title="MedCine 3D Studio",
+    page_icon="🧬",
+    layout="wide",
 )
 
-topic = st.text_input("Medical topic")
-duration = st.slider("Video duration (minutes)", 1, 10, 2)
-language = st.selectbox("Narration language", ["English", "Hindi", "Hinglish"])
+st.title("🧬 MedCine 3D Studio")
+st.write(
+    "Upload medical PDFs or notes images and create "
+    "an educational 3D animation prototype."
+)
 
-if st.button("Generate video"):
-    if not uploaded:
-        st.warning("Please upload a file first.")
-    elif not os.getenv("OPENAI_API_KEY"):
-        st.error("API key is not configured yet.")
-    else:
-        with tempfile.TemporaryDirectory() as folder:
-            path = os.path.join(folder, uploaded.name)
-            with open(path, "wb") as f:
-                f.write(uploaded.getvalue())
+st.info(
+    "Current prototype: uploads are extracted for review, "
+    "and a predefined simplified 3D lumbar spine animation "
+    "is rendered. The uploaded content does not yet change "
+    "the 3D anatomy automatically."
+)
 
-            with st.spinner("Analysing medical material..."):
-                content = extract_content(path)
-                scenes = generate_storyboard(
-                    content, topic, duration, language,
-                    "Cinematic medical", True
-                )
-                output = os.path.join(folder, "medcine_video.mp4")
-                render_video(
-                    scenes, output, duration, "720p", True
-                )
+uploaded_files = st.file_uploader(
+    "Upload PDFs or medical notes images",
+    type=[
+        "pdf", "png", "jpg", "jpeg", "webp",
+        "txt", "md", "docx", "pptx",
+    ],
+    accept_multiple_files=True,
+)
 
-            with open(output, "rb") as f:
-                video = f.read()
+topic = st.text_input(
+    "Medical topic",
+    value="Lumbar spine anatomy",
+)
 
-            st.video(video)
-            st.download_button(
-                "Download MP4",
-                video,
-                file_name="medcine_video.mp4",
-                mime="video/mp4"
+duration = st.slider(
+    "3D demo duration (seconds)",
+    min_value=8,
+    max_value=30,
+    value=12,
+)
+
+if st.button("Extract notes and generate 3D video"):
+    if not uploaded_files:
+        st.warning("Please upload at least one PDF or image.")
+        st.stop()
+
+    with tempfile.TemporaryDirectory() as folder:
+        extracted_sections = []
+
+        progress = st.progress(0)
+        status = st.empty()
+
+        for index, uploaded in enumerate(uploaded_files):
+            status.write(
+                f"Reading {uploaded.name}..."
             )
+
+            safe_name = Path(uploaded.name).name
+            file_path = os.path.join(folder, safe_name)
+
+            with open(file_path, "wb") as file:
+                file.write(uploaded.getvalue())
+
+            try:
+                content = extract_content(file_path)
+                if content.strip():
+                    extracted_sections.append(
+                        f"FILE: {safe_name}\n\n{content}"
+                    )
+                else:
+                    extracted_sections.append(
+                        f"FILE: {safe_name}\n"
+                        "No readable text was extracted."
+                    )
+            except Exception as error:
+                extracted_sections.append(
+                    f"FILE: {safe_name}\n"
+                    f"Extraction error: {error}"
+                )
+
+            progress.progress(
+                (index + 1) / len(uploaded_files)
+            )
+
+        combined_text = "\n\n".join(extracted_sections)
+
+        st.session_state["extracted_text"] = combined_text
+        st.session_state["topic"] = topic
+
+        status.write("Rendering the 3D demo...")
+
+        output_path = os.path.join(
+            folder,
+            "medcine_lumbar_spine.mp4",
+        )
+
+        try:
+            render_lumbar_spine(
+                output_path=output_path,
+                duration_seconds=duration,
+                fps=12,
+                resolution=640,
+            )
+
+            with open(output_path, "rb") as video_file:
+                video_bytes = video_file.read()
+
+            st.session_state["video_bytes"] = video_bytes
+            status.success("3D demo rendered successfully!")
+
+        except Exception as error:
+            status.error(
+                f"Rendering failed: {error}"
+            )
+
+if "extracted_text" in st.session_state:
+    st.subheader("Extracted notes")
+    st.caption(
+        "Review this text to check whether the PDF or image "
+        "was read correctly."
+    )
+
+    st.text_area(
+        "Extracted content",
+        value=st.session_state["extracted_text"],
+        height=220,
+    )
+
+if "video_bytes" in st.session_state:
+    st.subheader("Generated 3D educational demo")
+
+    st.video(st.session_state["video_bytes"])
+
+    st.download_button(
+        "Download 3D video (MP4)",
+        data=st.session_state["video_bytes"],
+        file_name="medcine_lumbar_spine.mp4",
+        mime="video/mp4",
+    )
+
+    st.caption(
+        "Educational prototype only. The animation is a "
+        "simplified model, not a clinically accurate rendering."
+    )
