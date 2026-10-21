@@ -1,179 +1,262 @@
 
-import json
 import os
+import re
+import textwrap
+import tempfile
 from pathlib import Path
 
+import streamlit as st
 from PIL import Image, ImageDraw, ImageFont
-import numpy as np
-from moviepy import ImageClip, concatenate_videoclips
+
+try:
+    from pypdf import PdfReader
+except ImportError:
+    PdfReader = None
+
+try:
+    from docx import Document
+except ImportError:
+    Document = None
 
 
-def extract_content(file_path):
-    path = Path(file_path)
-    ext = path.suffix.lower()
+def extract_content(uploaded_file):
+    """Extract readable text from an uploaded medical file."""
+    name = uploaded_file.name.lower()
+    content = ""
 
-    if ext in [".txt", ".md"]:
-        return path.read_text(encoding="utf-8", errors="ignore")
+    try:
+        uploaded_file.seek(0)
 
-    if ext == ".pdf":
-        import fitz
-        doc = fitz.open(file_path)
-        return "\n\n".join(page.get_text() for page in doc)
-
-    if ext == ".docx":
-        from docx import Document
-        doc = Document(file_path)
-        return "\n".join(p.text for p in doc.paragraphs)
-
-    if ext == ".pptx":
-        from pptx import Presentation
-        prs = Presentation(file_path)
-        result = []
-        for slide in prs.slides:
-            for shape in slide.shapes:
-                if getattr(shape, "has_text_frame", False):
-                    result.append(shape.text)
-        return "\n".join(result)
-
-    if ext in [".png", ".jpg", ".jpeg", ".webp"]:
-        try:
-            import pytesseract
-            return pytesseract.image_to_string(
-                Image.open(file_path)
+        if name.endswith(".txt"):
+            content = uploaded_file.read().decode(
+                "utf-8", errors="ignore"
             )
-        except Exception:
-            return "Image uploaded. Topic description is needed."
 
-    raise ValueError("Unsupported file format")
+        elif name.endswith(".pdf"):
+            if PdfReader is None:
+                raise RuntimeError("Install pypdf first.")
 
+            reader = PdfReader(uploaded_file)
+            content = "\n".join(
+                page.extract_text() or ""
+                for page in reader.pages
+            )
 
-def generate_storyboard(
-    content, topic, duration_minutes, language, style, add_labels=True
-):
-    from openai import OpenAI
+        elif name.endswith(".docx"):
+            if Document is None:
+                raise RuntimeError("Install python-docx first.")
 
-    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+            document = Document(uploaded_file)
+            content = "\n".join(
+                paragraph.text
+                for paragraph in document.paragraphs
+            )
 
-    prompt = f"""
-Create a medical educational video storyboard.
-Topic: {topic or 'Infer from source'}
-Source: {content[:20000]}
-Duration: {duration_minutes} minutes
-Language: {language}
-Visual style: {style}
-Include labels: {add_labels}
+        elif name.endswith((".png", ".jpg", ".jpeg")):
+            try:
+                import pytesseract
 
-Return JSON only:
-{{"scenes":[
-  {{"title":"Introduction",
-    "visual_description":"What viewers see",
-    "narration":"Educational narration",
-    "labels":["Anatomical structure"],
-    "duration_seconds":30}}
-]}}
+                image = Image.open(uploaded_file).convert("RGB")
+                content = pytesseract.image_to_string(image)
 
-Create enough scenes to cover the topic clearly.
-Explain normal anatomy, mechanism, body effects and recap.
-Do not invent facts unsupported by the source.
-"""
+            except Exception:
+                content = (
+                    "Image uploaded successfully. "
+                    "OCR is unavailable. Please enter the "
+                    "medical text manually."
+                )
 
-    response = client.chat.completions.create(
-        model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
-        messages=[
-            {"role": "system", "content": "Return valid JSON only."},
-            {"role": "user", "content": prompt},
-        ],
-        response_format={"type": "json_object"},
-    )
+        else:
+            raise ValueError("Unsupported file format.")
 
-    data = json.loads(response.choices[0].message.content)
-    scenes = data.get("scenes", [])
+    except Exception as exc:
+        raise RuntimeError(
+            f"Could not read the uploaded file: {exc}"
+        ) from exc
 
-    if not scenes:
-        raise ValueError("No scenes generated")
-
-    total = sum(max(1, int(s.get("duration_seconds", 10))) for s in scenes)
-
-    for scene in scenes:
-        old = max(1, int(scene.get("duration_seconds", 10)))
-        scene["duration_seconds"] = max(
-            1, round(old * duration_minutes * 60 / total)
+    if not content.strip():
+        raise ValueError(
+            "No readable text found. Scanned PDFs may need OCR."
         )
-        scene.setdefault("title", "Medical scene")
-        scene.setdefault("visual_description", "")
-        scene.setdefault("narration", "")
-        scene.setdefault("labels", [])
+
+    return content.strip()
+
+
+def generate_storyboard(content, max_scenes=8):
+    """Create a basic educational storyboard locally."""
+    if not content or not content.strip():
+        raise ValueError("Medical content is empty.")
+
+    clean_text = re.sub(r"\s+", " ", content).strip()
+
+    # Split text into readable chunks.
+    sentences = re.split(r"(?<=[.!?])\s+", clean_text)
+    sentences = [s.strip() for s in sentences if s.strip()]
+
+    if not sentences:
+        sentences = [clean_text]
+
+    chunk_size = max(1, (len(sentences) + max_scenes - 1)
+                     // max_scenes)
+
+    scenes = []
+
+    for index in range(0, len(sentences), chunk_size):
+        if len(scenes) >= max_scenes:
+            break
+
+        chunk = " ".join(sentences[index:index + chunk_size])
+
+        scenes.append({
+            "title": f"Medical Concept {len(scenes) + 1}",
+            "narration": chunk,
+            "visual": (
+                "Educational medical illustration: "
+                + chunk[:250]
+            ),
+            "duration": 6
+        })
 
     return scenes
 
 
-def render_video(
-    scenes, output_path, duration_minutes, resolution="720p",
-    disclaimer=True
-):
-    width, height = (
-        (1920, 1080) if resolution == "1080p" else (1280, 720)
-    )
-    font = ImageFont.load_default()
-    clips = []
+def _get_font(size):
+    """Use a system font if available."""
+    candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+        "C:/Windows/Fonts/arial.ttf",
+    ]
 
-    durations = [
-        max(1, int(s.get("duration_seconds", 10))) for s in scenes
-    ]
-    total = sum(durations)
-    durations = [
-        max(1, round(d * duration_minutes * 60 / total))
-        for d in durations
-    ]
-    durations[-1] += duration_minutes * 60 - sum(durations)
+    for font_path in candidates:
+        if os.path.exists(font_path):
+            try:
+                return ImageFont.truetype(font_path, size)
+            except OSError:
+                pass
+
+    return ImageFont.load_default()
+
+
+def _make_scene_image(scene, output_path, width=1280, height=720):
+    """Render a clean educational scene card."""
+    image = Image.new("RGB", (width, height), "#101827")
+    draw = ImageDraw.Draw(image)
+
+    title_font = _get_font(42)
+    body_font = _get_font(27)
+    small_font = _get_font(20)
+
+    draw.rectangle(
+        (0, 0, width, 14),
+        fill="#38BDF8"
+    )
+
+    draw.text(
+        (65, 55),
+        "MEDCINE 3D STUDIO",
+        font=small_font,
+        fill="#7DD3FC"
+    )
+
+    draw.text(
+        (65, 115),
+        scene.get("title", "Medical Concept"),
+        font=title_font,
+        fill="white"
+    )
+
+    visual = scene.get("visual", "")
+    narration = scene.get("narration", "")
+
+    draw.text(
+        (65, 205),
+        "VISUAL",
+        font=small_font,
+        fill="#38BDF8"
+    )
+
+    visual_lines = textwrap.wrap(visual, width=62)[:5]
+    y = 245
+
+    for line in visual_lines:
+        draw.text((65, y), line, font=body_font, fill="#E5E7EB")
+        y += 43
+
+    draw.line(
+        (65, 485, width - 65, 485),
+        fill="#334155",
+        width=2
+    )
+
+    draw.text(
+        (65, 510),
+        "EDUCATIONAL NOTES",
+        font=small_font,
+        fill="#7DD3FC"
+    )
+
+    notes_lines = textwrap.wrap(narration, width=78)[:4]
+    y = 550
+
+    for line in notes_lines:
+        draw.text((65, y), line, font=small_font, fill="white")
+        y += 31
+
+    image.save(output_path, quality=95)
+
+
+def render_video(storyboard, output_path=None):
+    """Render storyboard scenes into an MP4 video."""
+    if not storyboard:
+        raise ValueError("No scenes available to render.")
 
     try:
-        for i, scene in enumerate(scenes):
-            image = Image.new("RGB", (width, height), (5, 18, 32))
-            draw = ImageDraw.Draw(image)
+        import imageio.v2 as imageio
+        import numpy as np
+    except ImportError as exc:
+        raise RuntimeError(
+            "Install imageio and numpy using requirements.txt."
+        ) from exc
 
-            draw.rectangle((0, 0, width, 8), fill=(0, 210, 220))
-            draw.text(
-                (60, 50),
-                f"MEDCINE 3D STUDIO | SCENE {i + 1}",
-                font=font,
-                fill=(0, 220, 220),
-            )
-            draw.text(
-                (60, 120), scene["title"][:100],
-                font=font, fill="white"
-            )
+    if output_path is None:
+        output_path = os.path.join(
+            tempfile.gettempdir(), "medcine_video.mp4"
+        )
 
-            y = 190
-            for text in [
-                scene["visual_description"][:350],
-                "Labels: " + ", ".join(scene.get("labels", []))[:300],
-                "Narration: " + scene["narration"][:350],
-            ]:
-                draw.text((60, y), text, font=font, fill=(200, 220, 235))
-                y += 90
+    temp_dir = tempfile.mkdtemp(prefix="medcine_")
+    fps = 24
 
-            if disclaimer:
-                draw.text(
-                    (60, height - 40),
-                    "Educational visualization - verify medical content",
-                    font=font, fill=(100, 200, 200),
+    try:
+        with imageio.get_writer(
+            output_path,
+            fps=fps,
+            codec="libx264",
+            macro_block_size=16
+        ) as writer:
+
+            for scene in storyboard:
+                frame_path = os.path.join(
+                    temp_dir, f"scene_{storyboard.index(scene)}.png"
                 )
 
-            clips.append(
-                ImageClip(np.array(image)).with_duration(durations[i])
-            )
+                _make_scene_image(scene, frame_path)
 
-        final = concatenate_videoclips(clips, method="compose")
-        final.write_videofile(
-            output_path, fps=24, codec="libx264",
-            audio=False, logger=None
-        )
-        final.close()
+                frame = np.array(
+                    Image.open(frame_path).convert("RGB")
+                )
 
-    finally:
-        for clip in clips:
-            try:
-                clip.close()
-            except Exception:
-                pass
+                duration = max(
+                    2, min(int(scene.get("duration", 6)), 30)
+                )
+
+                for _ in range(fps * duration):
+                    writer.append_data(frame)
+
+        return output_path
+
+    except Exception as exc:
+        raise RuntimeError(
+            "Video rendering failed. Check FFmpeg support and "
+            f"dependencies. Details: {exc}"
+        ) from exc
