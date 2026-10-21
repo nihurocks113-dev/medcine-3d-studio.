@@ -111,7 +111,7 @@ if st.button("Extract notes and generate 3D video"):
                 duration_seconds=duration,
                 fps=12,
                 resolution=640,
-                total=total,
+                topic=topic,
             )
 
             with open(output_path, "rb") as video_file:
